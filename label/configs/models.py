@@ -13,5 +13,17 @@ MODEL_CONFIGS = {
         "temperature": 1e-5,
         "max_tokens": 4096,
         "tensor_parallel_size": 4 # 4*A100
+    },
+    "llama-3.1-8b-instruct": {
+        "model_path": "meta-llama/Llama-3.1-8B-Instruct",
+        "temperature": 1e-5,  
+        "max_tokens": 4096,
+        "tensor_parallel_size": 2 
+    },
+    "llama-3.1-70b-instruct": {
+        "model_path": "meta-llama/Llama-3.1-70B-Instruct",
+        "temperature": 1e-5,  
+        "max_tokens": 4096,
+        "tensor_parallel_size": 2
     }
 }

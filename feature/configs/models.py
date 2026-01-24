@@ -15,10 +15,10 @@ MODEL_CONFIGS = {
         "deployment": "gpt-4o-mini", # Deployment name for Azure API.
         "max_tokens": 4096
     },
-    "llama-3.1-8b": {
+    "llama-3.1-8b-instruct": {
         "model_path": "meta-llama/Llama-3.1-8B-Instruct",
-        "temperature": 1e-5,
+        "temperature": 1e-5,  
         "max_tokens": 4096,
-        "tensor_parallel_size": 4 # 4*A100
+        "tensor_parallel_size": 2 
     }
 }

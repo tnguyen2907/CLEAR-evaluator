@@ -42,7 +42,7 @@ class vLLMProcessor:
         Initialize vLLM model
         '''
         sampling_params = SamplingParams(temperature=self.config['temperature'], max_tokens=self.config['max_tokens'])
-        llm = LLM(self.config["model_path"], tensor_parallel_size=self.config["tensor_parallel_size"])
+        llm = LLM(self.config["model_path"], tensor_parallel_size=self.config["tensor_parallel_size"], max_model_len=4096)
         tokenizer = llm.get_tokenizer()
 
         return sampling_params, tokenizer, llm
@@ -94,6 +94,7 @@ class vLLMProcessor:
         for i, row in tqdm(df_gt_repo.iterrows(), total=len(df_gt_repo)):
             id = row['study_id']
             generated_text = ls_all_outputs[i].outputs[0].text
+            print(generated_text)
             task1_match = re.search(r'<TASK1>(.*?)</TASK1>', generated_text, re.DOTALL)
             
             if task1_match:

@@ -440,6 +440,22 @@ def cal_metrics(df_feature, name, mode, llm_config: Optional[dict] = None, skip_
     '''
     Calculate appropriate metrics based on feature mode (QA or IE)
     '''
+    # Fallback in case of zero true positive conditions in the whole dataset
+    if df_feature.empty:
+        print(f"WARNING: No data for '{name}' (zero true positive conditions)")
+        if mode == 'QA':
+            return {
+                'Feature': name,
+                'Acc. (micro)': 0.0,
+                'Acc.  (macro)': 0.0       
+            }, None
+        elif mode == 'IE':
+            return {
+                'Feature': name,
+                'ROUGE-L':  0.0,
+                'BLEU-4': 0.0
+            }, None
+            
     if mode == 'QA':
         # 1. Acc. (micro)
         acc_micro = compute_acc_mirco(df_feature['gt_feature'], df_feature['gen_feature'])

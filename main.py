@@ -134,7 +134,7 @@ def prepare_feature_label_csv(
     with open(pred_json, encoding="utf-8") as fh:
         preds = json.load(fh)
 
-    df_gt = pd.read_csv(gt_csv).set_index("study_id")
+    df_gt = pd.read_csv(gt_csv, dtype={'study_id': str}).set_index("study_id")
     df_tp = pd.DataFrame(0, index=df_gt.index, columns=df_gt.columns)
 
     for study_id, conditions in preds.items():
@@ -216,9 +216,12 @@ async def orchestrate(args: argparse.Namespace) -> None:
 
 
     # Stage 1: label inference (gt and gen parallelly)
-    label_results = await asyncio.gather(
-        *(run_label_inference(spec, args.label_backbone, args.label_model, output_root) for spec in specs)
-    )
+    label_results = []
+    for spec in specs:
+        label_results.append(
+            await run_label_inference(spec, args.label_backbone, args.label_model, output_root)
+        )
+
     label_dirs = {spec.tag: result[0] for spec, result in zip(specs, label_results)}
     pred_jsons = {spec.tag: result[1] for spec, result in zip(specs, label_results)}
 
@@ -248,18 +251,17 @@ async def orchestrate(args: argparse.Namespace) -> None:
     feature_dirs: dict[str, Path] = {}
     feature_jsons: dict[str, Path] = {}
     if feature_specs:
-        feature_results = await asyncio.gather(
-            *(
-                run_feature_inference(
+        feature_results = []
+        for spec in feature_specs:
+            feature_results.append(
+                await run_feature_inference(
                     spec,
                     args.feature_backbone,
                     args.feature_model,
                     filtered_csvs["generated"],
                     output_root,
                 )
-                for spec in feature_specs
             )
-        )
         feature_dirs = {spec.tag: result[0] for spec, result in zip(feature_specs, feature_results)}
         feature_jsons = {spec.tag: result[1] for spec, result in zip(feature_specs, feature_results)}
 

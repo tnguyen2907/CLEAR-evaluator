@@ -50,7 +50,7 @@ class vLLMProcessor:
         Unique for vllm
         '''
         sampling_params = SamplingParams(temperature=self.config["temperature"], max_tokens=self.config["max_tokens"])
-        llm = LLM(self.config["model_path"], tensor_parallel_size=self.config["tensor_parallel_size"])
+        llm = LLM(self.config["model_path"], tensor_parallel_size=self.config["tensor_parallel_size"], max_model_len=4096)
         tokenizer = llm.get_tokenizer()
 
         return sampling_params, tokenizer, llm
@@ -83,6 +83,7 @@ class vLLMProcessor:
         all_prompt_dict = PromptDict.get_all_prompt()
         ls_conditions = self.get_positive_conditions(labels)
         all_feature_dict = {} # layer 1: condition; layer 2: feature
+        
 
         # Step 2: Run Each Prompt Request
         for condition in ls_conditions:
@@ -91,6 +92,7 @@ class vLLMProcessor:
 
             for feature, prompt in prompt_dict.items():
                 generated_text = self.get_one_response(report, prompt)
+                print(generated_text)
                 match_feature = re.search(r'(\[.*?\])', generated_text, re.DOTALL)
                 temp_feature_dict[feature] = match_feature.group(1) if match_feature else "[\"NaN\"]" ### "Format Error" ## TO-DO: return one error list
 
@@ -101,16 +103,23 @@ class vLLMProcessor:
 
     def run(self):
         # Step 1: Prepare Files
-        df_repo = pd.read_csv(self.in_reports).sort_values(by='study_id').reset_index(drop=True) # str | str
-        df_labels = pd.read_csv(self.in_labels).sort_values(by='study_id').reset_index(drop=True) # str | int | ... | int
+        df_repo = pd.read_csv(self.in_reports, dtype={'study_id':  str})\
+            .sort_values(by='study_id')\
+            .reset_index(drop=True) # str | str
+        df_labels = pd.read_csv(self.in_labels, dtype={'study_id':  str})\
+            .sort_values(by='study_id')\
+            .reset_index(drop=True) # str | int | ... | int
         ls_id = df_repo['study_id'].unique()
         output_dict = {}
+        
+        print("input labels file:", self.in_labels)
 
         # Step 2: Iterate and extract
         for id in tqdm(ls_id):
             report = df_repo[df_repo['study_id'] == id]['report'].iloc[0]
             label_row = df_labels[df_labels["study_id"] == id].iloc[0].drop("study_id")
             output_dict[id] = self.run_feature_extraction(report, label_row)
+            print(output_dict[id])
 
         # Step 3: Save json
         output_path = os.path.join(self.out_dir, f"tmp/output_feature_{self.model}.json")
