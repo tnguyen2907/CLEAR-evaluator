@@ -94,7 +94,7 @@ class vLLMProcessor:
         for i, row in tqdm(df_gt_repo.iterrows(), total=len(df_gt_repo)):
             id = row['study_id']
             generated_text = ls_all_outputs[i].outputs[0].text
-            print(generated_text)
+            # print(generated_text)
             task1_match = re.search(r'<TASK1>(.*?)</TASK1>', generated_text, re.DOTALL)
             
             if task1_match:

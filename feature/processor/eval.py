@@ -144,7 +144,9 @@ def convert_feature_df(dict_gt: dict,
                 f"Condition mismatch for study_id '{id}'. Missing in generated: {sorted(missing_conditions)}; "
                 f"unexpected in generated: {sorted(extra_conditions)}"
             )
-
+        
+        appended = False
+        
         for condition, gt_feature_dict in gt_condition.items():
             if condition == 'Support Devices' and name not in FEATURE_CONFIG["Support Devices"]:
                 continue
@@ -185,6 +187,17 @@ def convert_feature_df(dict_gt: dict,
                 "gt_feature": gt_content,
                 "gen_feature": gen_content
             })
+            appended = True
+            
+        # If there is no true positive between gt and gen / all skipped, still add a row
+        if not appended:
+            temp_data.append({
+                "study_id": id,
+                "condition": None,
+                "gt_feature": None,
+                "gen_feature": None
+            })
+            continue
     
     df_feature = pd.DataFrame(temp_data)
     return df_feature
@@ -274,6 +287,9 @@ def compute_acc_mirco(gt: pd.Series, gen: pd.Series) -> float:
     '''
     Accuracy across all features
     '''
+    gt = gt.dropna()
+    gen = gen.dropna()
+    
     gt_list = gt.tolist()
     gen_list = gen.tolist()
     correct = sum(1 for gt, gen in zip(gt_list, gen_list) if gt == gen)
@@ -283,6 +299,8 @@ def compute_acc_macro(df: pd.DataFrame) -> float:
     '''
     Accuracy across all conditions
     '''
+    df = df.dropna(subset=["condition"])
+    
     conditions = df['condition'].unique()
     scores = []
 
@@ -296,6 +314,14 @@ def compute_acc_macro(df: pd.DataFrame) -> float:
             scores.append(score)
 
     return round(sum(scores) / len(scores), 3) if scores else float("nan")
+
+def compute_acc_per_row(df: pd.DataFrame) -> pd.Series:
+    def _acc(row) -> float:
+        if pd.isna(row["condition"]):
+            return 0.0
+        return float(row["gt_feature"] == row["gen_feature"])
+
+    return df.apply(_acc, axis=1)
 
 def preprocess(text: str):
     text = text.lower()
@@ -413,6 +439,12 @@ def compute_similarity(
     all_scores = []
     for gt_list, gen_list in zip(gt_series, gen_series):
         scores = []
+        
+        # if no true positive between gt and gen
+        if gt_list is None:
+            all_scores.append(0.0)
+            continue
+            
         for gt in gt_list:
             gt_tokens = preprocess(gt)
             if not gt_tokens:
@@ -434,54 +466,59 @@ def compute_similarity(
             scores.append(best_score)
         all_scores.append(np.mean(scores))
 
-    return round(np.mean(all_scores), 3) if all_scores else float('nan')
+    return round(np.mean(all_scores), 3) if all_scores else float('nan'), all_scores
 
 def cal_metrics(df_feature, name, mode, llm_config: Optional[dict] = None, skip_llm: bool = False):
     '''
     Calculate appropriate metrics based on feature mode (QA or IE)
-    '''
-    # Fallback in case of zero true positive conditions in the whole dataset
-    if df_feature.empty:
-        print(f"WARNING: No data for '{name}' (zero true positive conditions)")
-        if mode == 'QA':
-            return {
-                'Feature': name,
-                'Acc. (micro)': 0.0,
-                'Acc.  (macro)': 0.0       
-            }, None
-        elif mode == 'IE':
-            return {
-                'Feature': name,
-                'ROUGE-L':  0.0,
-                'BLEU-4': 0.0
-            }, None
-            
+    '''            
     if mode == 'QA':
         # 1. Acc. (micro)
         acc_micro = compute_acc_mirco(df_feature['gt_feature'], df_feature['gen_feature'])
 
         # 2. Acc. (macro)
         acc_macro = compute_acc_macro(df_feature)
+        
+        acc_per_report = compute_acc_per_row(df_feature)
 
         metric_dict = {
             'Feature': name,
             'Acc. (micro)': acc_micro,
             'Acc. (macro)': acc_macro       
         }
-        return metric_dict, None
+        
+        df_feature['acc'] = acc_per_report
+        
+        df_metric_per_report = df_metric_per_report = (
+            df_feature.groupby("study_id", sort=False)[["acc"]]
+            .mean()
+            .reset_index()
+        )
+        
+        return metric_dict, df_metric_per_report, None
 
     if mode == 'IE':
         # 1. ROUGE-L
-        rouge = compute_similarity(df_feature['gt_feature'], df_feature['gen_feature'], metric='rouge')
+        rouge, per_row_rouges = compute_similarity(df_feature['gt_feature'], df_feature['gen_feature'], metric='rouge')
 
         # 2. BLEU-4
-        bleu = compute_similarity(df_feature['gt_feature'], df_feature['gen_feature'], metric='bleu')
+        bleu, per_row_bleus = compute_similarity(df_feature['gt_feature'], df_feature['gen_feature'], metric='bleu')
 
         metric_dict = {
             'Feature': name,
             'ROUGE-L': rouge,
             'BLEU-4': bleu
         }
+        
+        df_feature['rouge'] = per_row_rouges
+        # df_feature['bleu'] = per_row_bleus
+        
+        df_metric_per_report = (
+            df_feature.groupby("study_id", sort=False)[["rouge"]]
+            .mean()
+            .reset_index()
+        )
+        
         llm_details = None
         if llm_config and not skip_llm:
             llm_score, llm_details = compute_similarity(
@@ -494,7 +531,7 @@ def cal_metrics(df_feature, name, mode, llm_config: Optional[dict] = None, skip_
             )
             metric_dict['LLM Score'] = llm_score
 
-        return metric_dict, llm_details
+        return metric_dict, df_metric_per_report, llm_details
 
     raise ValueError(f"Unsupported mode '{mode}' for metric calculation")
 
@@ -511,16 +548,23 @@ def evaluate_qa_features(
     metric_data = []
     mode = 'QA'
     
+    per_report_metric_dfs = []
     for name in FEATURE_CONFIG[mode]:
         print(f"Processing {name}...")
         # 1. transform df
         df_feature = convert_feature_df(dict_gt, dict_gen, name, mode)
 
         # 2. calculate metrics
-        metric_dict, _ = cal_metrics(df_feature, name, mode)
+        metric_dict, per_report_metric_df, _ = cal_metrics(df_feature, name, mode)
 
         # 3. output metric
         metric_data.append(metric_dict)
+        
+        # 3.5. per-report metric
+        per_report_metric_df = per_report_metric_df\
+            .rename(columns={"acc": name})\
+            .set_index("study_id")
+        per_report_metric_dfs.append(per_report_metric_df)
 
     metric_df = pd.DataFrame(metric_data)
     os.makedirs(metric_pth, exist_ok=True)
@@ -529,6 +573,11 @@ def evaluate_qa_features(
     output_file = os.path.join(metric_pth, output_filename)
     metric_df.to_csv(output_file, index=False)
     print(f"QA evaluation results saved to {output_file}")
+    
+    df_all_qa_metrics_per_report = pd.concat(per_report_metric_dfs, axis=1).reset_index()
+    output_file_per_report = os.path.join(metric_pth, f"results_qa_per_report_{model_name}.csv")
+    df_all_qa_metrics_per_report.to_csv(output_file_per_report, index=False)
+    print(f"QA per-report evaluation results saved to {output_file_per_report}")
     return metric_df
 
 def evaluate_ie_features(
@@ -546,13 +595,14 @@ def evaluate_ie_features(
     metric_data = []
     mode = 'IE'
     
+    per_report_metric_dfs = []
     for name in FEATURE_CONFIG[mode]:
         print(f"Processing {name}...")
         # 1. transform df
         df_feature = convert_feature_df(dict_gt, dict_gen, name, mode)
 
         # 2. calculate metrics
-        metric_dict, llm_details = cal_metrics(
+        metric_dict, per_report_metric_df, llm_details = cal_metrics(
             df_feature,
             name,
             mode,
@@ -562,6 +612,12 @@ def evaluate_ie_features(
 
         # 3. output metric
         metric_data.append(metric_dict)
+        
+        # 3.5. per-report metric: Only use ROUGE
+        per_report_metric_df = per_report_metric_df\
+            .rename(columns={"rouge": name})\
+            .set_index("study_id")
+        per_report_metric_dfs.append(per_report_metric_df)
 
         # 4. detailed llm eval output
         if llm_details is not None and not llm_details.empty:
@@ -578,6 +634,12 @@ def evaluate_ie_features(
     output_file = os.path.join(metric_pth, output_filename)
     metric_df.to_csv(output_file, index=False)
     print(f"IE evaluation results saved to {output_file}")
+    
+    df_all_ie_metrics_per_report = pd.concat(per_report_metric_dfs, axis=1).reset_index()
+    output_file_per_report = os.path.join(metric_pth, f"results_ie_per_report_{model_name}.csv")
+    df_all_ie_metrics_per_report.to_csv(output_file_per_report, index=False)
+    print(f"IE per-report evaluation results saved to {output_file_per_report}")
+    
     return metric_df
 
 def main():

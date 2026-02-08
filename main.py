@@ -215,7 +215,7 @@ async def orchestrate(args: argparse.Namespace) -> None:
         specs.append(DatasetSpec("reference", args.gt_reports.resolve()))
 
 
-    # Stage 1: label inference (gt and gen parallelly)
+    # Stage 1: label inference
     label_results = []
     for spec in specs:
         label_results.append(
@@ -246,7 +246,7 @@ async def orchestrate(args: argparse.Namespace) -> None:
             output_root / "generated" / f"filtered_tp_labels_{args.label_model}.csv",
         )
 
-    # Stage 4: feature inference (gt and gen parallelly)
+    # Stage 4: feature inference (gt and gen)
     feature_specs = [spec for spec in specs]
     feature_dirs: dict[str, Path] = {}
     feature_jsons: dict[str, Path] = {}

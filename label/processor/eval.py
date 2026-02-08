@@ -68,6 +68,25 @@ def compute_f1(df_gt, df_pred):
     neg_f1, neg_f1_five, neg_micro_f1, label_neg_f1 = negative_f1(y_gt_neg, y_pred_neg)
     return pos_f1, pos_f1_five, pos_micro_f1, neg_f1, neg_f1_five, neg_micro_f1, label_pos_f1, label_neg_f1
 
+# Computes per-report positive F1
+def compute_per_report_pos_f1(df_gt, df_pred):
+    y_gt = np.array(df_gt[CXR_LABELS_1]) 
+    y_gt_pos = (y_gt == 1).astype(int)
+
+    y_pred = np.array(df_pred[CXR_LABELS_1])
+    y_pred_pos = (y_pred == 1).astype(int)
+    
+    scores = []
+    for i in range(y_gt_pos.shape[0]):
+        s = f1_score(y_gt_pos[i], y_pred_pos[i], zero_division=0)
+        scores.append(s)
+        
+    df_out = pd.DataFrame({
+        "study_id": df_gt["study_id"].astype(str).values,
+        "pos_f1_per_report": np.array(scores, dtype=float),
+    })
+    
+    return df_out
 
 def check_format_match(df_gen_labels): # check whether all convert to labels
     allowed_values = {0, 1, -1}
@@ -197,6 +216,14 @@ if __name__ == '__main__':
     metrics_path = os.path.join(gen_dir, f'label_metrics_{args.model_name}.csv')
     df_metrics1.to_csv(metrics_path, index=False)
     print(f"Metrics saved to {metrics_path}")
+    
+    # Per-report metric
+    df_per_report = compute_per_report_pos_f1(df_gt_labels, df_gen_labels)
+    per_report_path = os.path.join(gen_dir, f'label_metrics_per_report_{args.model_name}.csv')
+    
+    df_per_report.to_csv(per_report_path, index=False)
+    print(f"Per-report positive F1 saved to {per_report_path}")
+    
 
     if len(dict_err) > 0:
         error_file = gen_dir + 'format_errors.json'
