@@ -17,8 +17,8 @@ MODEL_CONFIGS = {
     },
     "llama-3.1-8b-instruct": {
         "model_path": "meta-llama/Llama-3.1-8B-Instruct",
-        "temperature": 1e-5,  
+        "temperature": 1e-5,
         "max_tokens": 4096,
-        "tensor_parallel_size": 2 
+        "tensor_parallel_size": 2  # 2*H200
     }
 }

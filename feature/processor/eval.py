@@ -5,8 +5,6 @@ import pandas as pd
 import numpy as np
 import math
 import os
-import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import argparse
 from typing import Optional, Tuple
@@ -15,8 +13,8 @@ from rouge_score import rouge_scorer
 from openai import AzureOpenAI
 from tqdm import tqdm
 
-from configs.prompts import LLMMetricPrompts
-from configs.models import MODEL_CONFIGS
+from ..configs.prompts import LLMMetricPrompts
+from ..configs.models import MODEL_CONFIGS
 
 # Feature configuration
 FEATURE_CONFIG = {
@@ -434,6 +432,8 @@ def compute_similarity(
             return_details=return_details,
             context=context
         )
+        # WARNING: LLM path returns (score, details) or bare score depending on return_details,
+        # while the lexical path below always returns (score, all_scores). Keep in sync if changing.
         return (score, details) if return_details else score
 
     all_scores = []
@@ -489,7 +489,7 @@ def cal_metrics(df_feature, name, mode, llm_config: Optional[dict] = None, skip_
         
         df_feature['acc'] = acc_per_report
         
-        df_metric_per_report = df_metric_per_report = (
+        df_metric_per_report = (
             df_feature.groupby("study_id", sort=False)[["acc"]]
             .mean()
             .reset_index()

@@ -1,6 +1,4 @@
 import os
-import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import numpy as np
 import pandas as pd
@@ -9,8 +7,8 @@ import argparse
 import re
 from openai import AzureOpenAI
 import json
-from configs.models import MODEL_CONFIGS
-from configs.prompts import SYS_PROMPT
+from ..configs.models import MODEL_CONFIGS
+from ..configs.prompts import SYS_PROMPT
 
 
 def parse_args():

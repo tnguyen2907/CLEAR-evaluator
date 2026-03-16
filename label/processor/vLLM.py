@@ -1,6 +1,4 @@
 import os
-import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from tqdm import tqdm
 import numpy as np
@@ -9,8 +7,8 @@ import argparse
 import re
 from vllm import LLM, SamplingParams
 import json
-from configs.models import MODEL_CONFIGS
-from configs.prompts import SYS_PROMPT
+from ..configs.models import MODEL_CONFIGS
+from ..configs.prompts import SYS_PROMPT
 
 
 def parse_args():
@@ -42,7 +40,7 @@ class vLLMProcessor:
         Initialize vLLM model
         '''
         sampling_params = SamplingParams(temperature=self.config['temperature'], max_tokens=self.config['max_tokens'])
-        llm = LLM(self.config["model_path"], tensor_parallel_size=self.config["tensor_parallel_size"], max_model_len=4096)
+        llm = LLM(self.config["model_path"], tensor_parallel_size=self.config["tensor_parallel_size"], max_model_len=4096, gpu_memory_utilization=self.config.get("gpu_memory_utilization", 0.75))
         tokenizer = llm.get_tokenizer()
 
         return sampling_params, tokenizer, llm
