@@ -1,17 +1,14 @@
 import os
-import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 import argparse
 import re
-# from openai import AzureOpenAI
 from vllm import LLM, SamplingParams
 import json
-from configs.prompts import PromptDict
-from configs.models import MODEL_CONFIGS
+from ..configs.prompts import PromptDict
+from ..configs.models import MODEL_CONFIGS
 
 
 

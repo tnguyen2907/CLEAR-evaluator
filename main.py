@@ -10,15 +10,15 @@ import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parent
 LABEL_INFER = {
-    "azure": REPO_ROOT / "label" / "processor" / "AzureOpenAI.py",
-    "vllm": REPO_ROOT / "label" / "processor" / "vLLM.py",
+    "azure": "clear_evaluator.label.processor.AzureOpenAI",
+    "vllm": "clear_evaluator.label.processor.vLLM",
 }
 FEATURE_INFER = {
-    "azure": REPO_ROOT / "feature" / "processor" / "AzureOpenAI.py",
-    "vllm": REPO_ROOT / "feature" / "processor" / "vLLM.py",
+    "azure": "clear_evaluator.feature.processor.AzureOpenAI",
+    "vllm": "clear_evaluator.feature.processor.vLLM",
 }
-LABEL_EVAL = REPO_ROOT / "label" / "processor" / "eval.py"
-FEATURE_EVAL = REPO_ROOT / "feature" / "processor" / "eval.py"
+LABEL_EVAL = "clear_evaluator.label.processor.eval"
+FEATURE_EVAL = "clear_evaluator.feature.processor.eval"
 POSITIVE_VALUE = 1  # feature pipeline expects 1 for true positives
 CXR_LABEL_COLUMNS = [
     "Enlarged Cardiomediastinum",
@@ -47,7 +47,7 @@ class DatasetSpec:
 
 async def run_cmd(tag: str, command: list[str]) -> None:
     print(f"[{tag}] {' '.join(command)}")
-    proc = await asyncio.create_subprocess_exec(*command, cwd=str(REPO_ROOT))
+    proc = await asyncio.create_subprocess_exec(*command)
     rc = await proc.wait()
     if rc != 0:
         raise RuntimeError(f"{tag} failed with exit code {rc}")
@@ -60,7 +60,7 @@ async def run_label_inference(spec: DatasetSpec, backbone: str, model: str, outp
 
     cmd = [
         sys.executable,
-        str(LABEL_INFER[backbone]),
+        "-m", LABEL_INFER[backbone],
         "--model_name",
         model,
         "--reports",
@@ -78,7 +78,7 @@ async def run_label_evaluation(spec: DatasetSpec, out_dir: Path, model: str) -> 
         return
     cmd = [
         sys.executable,
-        str(LABEL_EVAL),
+        "-m", LABEL_EVAL,
         "--gt_dir",
         str(spec.label_gt),
         "--gen_dir",
@@ -164,7 +164,7 @@ async def run_feature_inference(
 
     cmd = [
         sys.executable,
-        str(FEATURE_INFER[backbone]),
+        "-m", FEATURE_INFER[backbone],
         "--model",
         model,
         "--reports",
@@ -191,7 +191,7 @@ async def run_feature_evaluation(
         return
     cmd = [
         sys.executable,
-        str(FEATURE_EVAL),
+        "-m", FEATURE_EVAL,
         "--gen_path",
         str(gen_json),
         "--gt_path",

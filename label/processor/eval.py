@@ -3,12 +3,17 @@ import glob
 import json
 import os
 import argparse
-import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import f1_score
+
+CXR_LABELS_1 = [
+    'Enlarged Cardiomediastinum', 'Cardiomegaly',
+    'Lung Opacity', 'Lung Lesion', 'Edema', 'Consolidation', 'Pneumonia',
+    'Atelectasis', 'Pneumothorax', 'Pleural Effusion', 'Pleural Other',
+    'Fracture', 'Support Devices',
+]
 
 # Computes negative F1 and negative F1-5 for the labels:
 # Edema, Consolidation, Pneumonia, Pneumothorax, Pleural Effusion.
@@ -139,11 +144,6 @@ if __name__ == '__main__':
     gt_file = args.gt_dir
     gen_dir = args.gen_dir 
     label_dir = os.path.join(gen_dir, 'tmp')
-
-    CXR_LABELS_1 = ['Enlarged Cardiomediastinum', 'Cardiomegaly',
-        'Lung Opacity', 'Lung Lesion', 'Edema', 'Consolidation', 'Pneumonia',
-        'Atelectasis', 'Pneumothorax', 'Pleural Effusion', 'Pleural Other',
-        'Fracture', 'Support Devices'] ## exclude No Finding
 
     # Step 2: Load the data
     requested_filename = f'output_labels_{args.model_name}.json'
