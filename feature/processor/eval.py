@@ -433,7 +433,7 @@ def compute_similarity(
             context=context
         )
         # WARNING: LLM path returns (score, details) or bare score depending on return_details,
-+        # while the lexical path below always returns (score, all_scores). Keep in sync if changing.
+        # while the lexical path below always returns (score, all_scores). Keep in sync if changing.
         return (score, details) if return_details else score
 
     all_scores = []
