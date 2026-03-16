@@ -140,6 +140,13 @@ def prepare_feature_label_csv(
     for study_id, conditions in preds.items():
         if study_id not in df_tp.index:
             continue
+        if isinstance(conditions, str):
+            try:
+                conditions = json.loads(conditions)
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(conditions, dict):
+            continue
         for condition, value in conditions.items():
             if condition not in df_tp.columns:
                 continue
