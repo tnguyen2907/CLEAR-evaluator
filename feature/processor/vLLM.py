@@ -47,7 +47,7 @@ class vLLMProcessor:
         Unique for vllm
         '''
         sampling_params = SamplingParams(temperature=self.config["temperature"], max_tokens=self.config["max_tokens"])
-        llm = LLM(self.config["model_path"], tensor_parallel_size=self.config["tensor_parallel_size"], max_model_len=4096)
+        llm = LLM(self.config["model_path"], tensor_parallel_size=self.config["tensor_parallel_size"], max_model_len=4096, gpu_memory_utilization=self.config.get("gpu_memory_utilization", 0.75))
         tokenizer = llm.get_tokenizer()
 
         return sampling_params, tokenizer, llm
