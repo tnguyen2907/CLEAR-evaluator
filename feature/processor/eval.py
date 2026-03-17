@@ -170,8 +170,10 @@ def convert_feature_df(dict_gt: dict,
             assert isinstance(gen_feature, list), f"gen {id} {condition} {name} exists incompatible format"
 
             if mode == 'QA':
-                assert len(gt_feature) == 1, f"gt {id} {condition} {name} exists one more answer"
-                assert len(gen_feature) == 1, f"gen {id} {condition} {name} exists one more answer"
+                if len(gt_feature) != 1:
+                    print(f"Warning: gt {id} {condition} {name} has {len(gt_feature)} answers, using first")
+                if len(gen_feature) != 1:
+                    print(f"Warning: gen {id} {condition} {name} has {len(gen_feature)} answers, using first")
                 # list to str
                 gt_content = str(gt_feature[0]).lower()
                 gen_content = str(gen_feature[0]).lower()

@@ -170,7 +170,7 @@ if __name__ == '__main__':
                 print(study_id)
                 dict_err[study_id] = conditions ### save to solve other format errors
                 ls_err_id.append(study_id)
-                conditions = {c: -1 for c in CXR_LABELS_1}
+                conditions = {c: -1 for c in CXR_LABELS_1}  # default to unclear (-1) so the study is not dropped
         
         for condition in CXR_LABELS_1:
             if condition in conditions: ### missing conditions
