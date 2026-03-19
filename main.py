@@ -2,6 +2,8 @@ import argparse
 import asyncio
 import importlib
 import json
+import os
+import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -48,7 +50,7 @@ class DatasetSpec:
 
 
 def get_vllm_config(backbone: str, model: str, stage: str):
-    """Import the model config to get TP/DP for torchrun launcher."""
+    """Import model config for orchestration decisions."""
     if backbone != "vllm":
         return None
 
@@ -61,33 +63,131 @@ def get_vllm_config(backbone: str, model: str, stage: str):
     return model_configs.get(model)
 
 
-async def run_cmd(tag: str, command: list[str]) -> None:
+def infer_device_groups(config: dict[str, object] | None) -> list[list[str]] | None:
+    if config is None:
+        return None
+
+    explicit_groups = config.get("device_groups")
+    if explicit_groups:
+        groups = [[str(device) for device in group] for group in explicit_groups]
+        dp = int(config.get("data_parallel_size", len(groups)))
+        return groups[:dp] or None
+
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible_devices:
+        devices = [device.strip() for device in visible_devices.split(",") if device.strip()]
+    else:
+        try:
+            import torch
+            devices = [str(idx) for idx in range(torch.cuda.device_count())]
+        except Exception:
+            devices = []
+
+    if not devices:
+        return None
+
+    tp = int(config.get("tensor_parallel_size", 1))
+    dp = int(config.get("data_parallel_size", 1))
+    if tp <= 0:
+        return None
+
+    groups = []
+    for start in range(0, len(devices), tp):
+        group = devices[start:start + tp]
+        if len(group) == tp:
+            groups.append(group)
+    if dp > 0:
+        groups = groups[:dp]
+    return groups or None
+
+
+def shard_report_csv(input_csv: Path, output_dir: Path, num_shards: int) -> list[Path]:
+    df = pd.read_csv(input_csv, dtype={"study_id": str})
+    if not df.empty:
+        df = df.sort_values(by="study_id").reset_index(drop=True)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    shard_paths: list[Path] = []
+    for shard_idx in range(num_shards):
+        shard_df = df.iloc[shard_idx::num_shards].copy().reset_index(drop=True)
+        shard_path = output_dir / f"reports_shard_{shard_idx}.csv"
+        shard_df.to_csv(shard_path, index=False)
+        shard_paths.append(shard_path)
+    return shard_paths
+
+
+def merge_json_files(json_paths: list[Path], output_path: Path) -> Path:
+    merged: dict[str, object] = {}
+    for json_path in json_paths:
+        with open(json_path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        duplicate_ids = set(merged).intersection(data)
+        if duplicate_ids:
+            raise ValueError(f"Duplicate study_ids encountered while merging {json_path}: {sorted(duplicate_ids)}")
+        merged.update(data)
+
+    merged = dict(sorted(merged.items()))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as handle:
+        json.dump(merged, handle, ensure_ascii=False, indent=4)
+    return output_path
+
+
+async def run_cmd(tag: str, command: list[str], env: dict[str, str] | None = None) -> None:
     print(f"[{tag}] {' '.join(command)}")
-    proc = await asyncio.create_subprocess_exec(*command)
+    proc = await asyncio.create_subprocess_exec(*command, env=env)
     rc = await proc.wait()
     if rc != 0:
         raise RuntimeError(f"{tag} failed with exit code {rc}")
 
 
-def build_torchrun_cmd(module: str, nproc: int, args: list[str]) -> list[str]:
-    """Build a torchrun command for launching vLLM with data parallelism."""
-    return [
-        sys.executable, "-m", "torch.distributed.run",
-        f"--nproc-per-node={nproc}",
-        "-m", module,
-    ] + args
-
-
 def build_inference_cmd(backbone: str, module: str, model: str, extra_args: list[str], stage: str) -> list[str]:
-    """Build the subprocess command, using torchrun for vLLM backends."""
-    if backbone == "vllm":
-        config = get_vllm_config(backbone, model, stage)
-        tp = config.get("tensor_parallel_size", 1)
-        dp = config.get("data_parallel_size", 1)
-        nproc = tp * dp
-        return build_torchrun_cmd(module, nproc, extra_args)
-    else:
-        return [sys.executable, "-m", module] + extra_args
+    return [sys.executable, "-m", module] + extra_args
+
+
+async def run_vllm_sharded_inference(
+    *,
+    tag: str,
+    stage: str,
+    module: str,
+    model: str,
+    reports_csv: Path,
+    output_dir: Path,
+    extra_args_builder,
+) -> Path:
+    config = get_vllm_config("vllm", model, stage)
+    device_groups = infer_device_groups(config)
+
+    if not device_groups or len(device_groups) == 1:
+        extra_args = extra_args_builder(reports_csv, output_dir)
+        cmd = build_inference_cmd("vllm", module, model, extra_args, stage)
+        await run_cmd(f"{tag}-{stage}-infer", cmd)
+        suffix = "labels" if stage == "label" else "feature"
+        return output_dir / "tmp" / f"output_{suffix}_{model}.json"
+
+    shard_root = output_dir / "tmp" / "shards"
+    if shard_root.exists():
+        shutil.rmtree(shard_root)
+    shard_paths = shard_report_csv(reports_csv, shard_root, len(device_groups))
+
+    shard_json_paths: list[Path] = []
+    tasks = []
+    for shard_idx, (device_group, shard_reports_csv) in enumerate(zip(device_groups, shard_paths)):
+        shard_out_dir = shard_root / f"replica_{shard_idx}"
+        shard_out_dir.mkdir(parents=True, exist_ok=True)
+        shard_json_name = f"output_labels_{model}.json" if stage == "label" else f"output_feature_{model}.json"
+        shard_json_paths.append(shard_out_dir / "tmp" / shard_json_name)
+
+        extra_args = extra_args_builder(shard_reports_csv, shard_out_dir)
+        cmd = build_inference_cmd("vllm", module, model, extra_args, stage)
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(device_group)
+        tasks.append(run_cmd(f"{tag}-{stage}-infer-replica{shard_idx}", cmd, env=env))
+
+    await asyncio.gather(*tasks)
+
+    final_json_name = f"output_labels_{model}.json" if stage == "label" else f"output_feature_{model}.json"
+    return merge_json_files(shard_json_paths, output_dir / "tmp" / final_json_name)
 
 
 async def run_label_inference(spec: DatasetSpec, backbone: str, model: str, output_root: Path) -> tuple[Path, Path]:
@@ -95,14 +195,29 @@ async def run_label_inference(spec: DatasetSpec, backbone: str, model: str, outp
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "tmp").mkdir(exist_ok=True)
 
-    extra_args = [
-        "--model_name", model,
-        "--reports", str(spec.reports),
-        "--output", str(out_dir),
-    ]
-    cmd = build_inference_cmd(backbone, LABEL_INFER[backbone], model, extra_args, "label")
-    await run_cmd(f"{spec.tag}-label-infer", cmd)
-    pred_json = out_dir / "tmp" / f"output_labels_{model}.json"
+    if backbone == "vllm":
+        pred_json = await run_vllm_sharded_inference(
+            tag=spec.tag,
+            stage="label",
+            module=LABEL_INFER[backbone],
+            model=model,
+            reports_csv=spec.reports,
+            output_dir=out_dir,
+            extra_args_builder=lambda reports_csv, shard_out_dir: [
+                "--model_name", model,
+                "--reports", str(reports_csv),
+                "--output", str(shard_out_dir),
+            ],
+        )
+    else:
+        extra_args = [
+            "--model_name", model,
+            "--reports", str(spec.reports),
+            "--output", str(out_dir),
+        ]
+        cmd = build_inference_cmd(backbone, LABEL_INFER[backbone], model, extra_args, "label")
+        await run_cmd(f"{spec.tag}-label-infer", cmd)
+        pred_json = out_dir / "tmp" / f"output_labels_{model}.json"
     return out_dir, pred_json
 
 
@@ -202,15 +317,56 @@ async def run_feature_inference(
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "tmp").mkdir(exist_ok=True)
 
-    extra_args = [
-        "--model", model,
-        "--reports", str(spec.reports),
-        "--labels", str(filtered_labels),
-        "--output", str(out_dir),
-    ]
-    cmd = build_inference_cmd(backbone, FEATURE_INFER[backbone], model, extra_args, "feature")
-    await run_cmd(f"{spec.tag}-feature-infer", cmd)
-    gen_json = out_dir / "tmp" / f"output_feature_{model}.json"
+    if backbone == "vllm":
+        config = get_vllm_config("vllm", model, "feature")
+        device_groups = infer_device_groups(config)
+
+        if not device_groups or len(device_groups) == 1:
+            extra_args = [
+                "--model", model,
+                "--reports", str(spec.reports),
+                "--labels", str(filtered_labels),
+                "--output", str(out_dir),
+            ]
+            cmd = build_inference_cmd(backbone, FEATURE_INFER[backbone], model, extra_args, "feature")
+            await run_cmd(f"{spec.tag}-feature-infer", cmd)
+            gen_json = out_dir / "tmp" / f"output_feature_{model}.json"
+        else:
+            shard_root = out_dir / "tmp" / "shards"
+            if shard_root.exists():
+                shutil.rmtree(shard_root)
+            report_shards = shard_report_csv(spec.reports, shard_root / "reports", len(device_groups))
+            label_shards = shard_report_csv(filtered_labels, shard_root / "labels", len(device_groups))
+
+            shard_json_paths: list[Path] = []
+            tasks = []
+            for shard_idx, (device_group, report_shard, label_shard) in enumerate(zip(device_groups, report_shards, label_shards)):
+                shard_out_dir = shard_root / f"replica_{shard_idx}"
+                shard_out_dir.mkdir(parents=True, exist_ok=True)
+                shard_json_paths.append(shard_out_dir / "tmp" / f"output_feature_{model}.json")
+                extra_args = [
+                    "--model", model,
+                    "--reports", str(report_shard),
+                    "--labels", str(label_shard),
+                    "--output", str(shard_out_dir),
+                ]
+                cmd = build_inference_cmd(backbone, FEATURE_INFER[backbone], model, extra_args, "feature")
+                env = os.environ.copy()
+                env["CUDA_VISIBLE_DEVICES"] = ",".join(device_group)
+                tasks.append(run_cmd(f"{spec.tag}-feature-infer-replica{shard_idx}", cmd, env=env))
+
+            await asyncio.gather(*tasks)
+            gen_json = merge_json_files(shard_json_paths, out_dir / "tmp" / f"output_feature_{model}.json")
+    else:
+        extra_args = [
+            "--model", model,
+            "--reports", str(spec.reports),
+            "--labels", str(filtered_labels),
+            "--output", str(out_dir),
+        ]
+        cmd = build_inference_cmd(backbone, FEATURE_INFER[backbone], model, extra_args, "feature")
+        await run_cmd(f"{spec.tag}-feature-infer", cmd)
+        gen_json = out_dir / "tmp" / f"output_feature_{model}.json"
     return out_dir, gen_json
 
 
@@ -320,34 +476,24 @@ async def orchestrate(args: argparse.Namespace) -> None:
 
     tags = [spec.tag for spec in specs]
 
-    # ── Stage 1: label inference (merged gen+ref → single model run) ──
+    # Stage 1: label inference on merged generated/reference reports
     merged_reports_csv = output_root / "tmp" / "merged_reports.csv"
     merge_report_csvs({spec.tag: spec.reports for spec in specs}, merged_reports_csv)
 
-    # Create a temporary spec for the merged run
     merged_label_spec = DatasetSpec("merged", merged_reports_csv)
-    label_out_dir = output_root / "merged" / "labels"
-    label_out_dir.mkdir(parents=True, exist_ok=True)
-    (label_out_dir / "tmp").mkdir(exist_ok=True)
-
-    extra_args = [
-        "--model_name", args.label_model,
-        "--reports", str(merged_reports_csv),
-        "--output", str(label_out_dir),
-    ]
-    cmd = build_inference_cmd(args.label_backbone, LABEL_INFER[args.label_backbone], args.label_model, extra_args, "label")
-    await run_cmd("merged-label-infer", cmd)
-
-    # Split merged results back to per-source
-    merged_label_json = label_out_dir / "tmp" / f"output_labels_{args.label_model}.json"
+    merged_label_out_dir, merged_label_json = await run_label_inference(
+        merged_label_spec,
+        args.label_backbone,
+        args.label_model,
+        output_root,
+    )
     pred_jsons = split_label_json(merged_label_json, tags, output_root, args.label_model)
 
-    # Also create per-source label output dirs for eval
-    label_dirs = {}
+    label_dirs: dict[str, Path] = {}
     for spec in specs:
-        d = output_root / spec.tag / "labels"
-        d.mkdir(parents=True, exist_ok=True)
-        label_dirs[spec.tag] = d
+        label_dir = output_root / spec.tag / "labels"
+        label_dir.mkdir(parents=True, exist_ok=True)
+        label_dirs[spec.tag] = label_dir
 
     generated_spec = specs[0]
     reference_spec = next((spec for spec in specs if spec.tag == "reference"), None)
@@ -357,10 +503,10 @@ async def orchestrate(args: argparse.Namespace) -> None:
         generated_spec.label_gt = gt_csv_path
         reference_spec.label_gt = gt_csv_path
 
-    # ── Stage 2: label evaluation ──
+    # Stage 2: label evaluation
     await run_label_evaluation(generated_spec, label_dirs["generated"], args.label_model)
 
-    # ── Stage 3: build filtered label CSV ──
+    # Stage 3: build filtered label CSV
     filtered_csvs: dict[str, Path] = {}
     if generated_spec.label_gt is not None:
         filtered_csvs["generated"] = await asyncio.to_thread(
@@ -374,45 +520,36 @@ async def orchestrate(args: argparse.Namespace) -> None:
     print("Waiting 15s for GPU memory cleanup...")
     time.sleep(15)
 
-    # ── Stage 4: feature inference (merged gen+ref → single model run) ──
+    # Stage 4: feature inference on merged generated/reference reports
     feature_specs = [spec for spec in specs]
     feature_dirs: dict[str, Path] = {}
     feature_jsons: dict[str, Path] = {}
     if feature_specs and "generated" in filtered_csvs:
-        # Merge reports and labels for all sources
         merged_feature_reports = output_root / "tmp" / "merged_feature_reports.csv"
         merge_report_csvs({spec.tag: spec.reports for spec in feature_specs}, merged_feature_reports)
 
-        # For feature labels, we use the same filtered TP labels for all sources
-        # but need to prefix study_ids to match merged reports
         merged_feature_labels = output_root / "tmp" / "merged_feature_labels.csv"
-        label_csv_paths = {spec.tag: filtered_csvs["generated"] for spec in feature_specs}
-        merge_label_csvs(label_csv_paths, merged_feature_labels)
+        merge_label_csvs(
+            {spec.tag: filtered_csvs["generated"] for spec in feature_specs},
+            merged_feature_labels,
+        )
 
-        feature_out_dir = output_root / "merged" / "features"
-        feature_out_dir.mkdir(parents=True, exist_ok=True)
-        (feature_out_dir / "tmp").mkdir(exist_ok=True)
+        merged_feature_spec = DatasetSpec("merged", merged_feature_reports)
+        _, merged_feature_json = await run_feature_inference(
+            merged_feature_spec,
+            args.feature_backbone,
+            args.feature_model,
+            merged_feature_labels,
+            output_root,
+        )
 
-        extra_args = [
-            "--model", args.feature_model,
-            "--reports", str(merged_feature_reports),
-            "--labels", str(merged_feature_labels),
-            "--output", str(feature_out_dir),
-        ]
-        cmd = build_inference_cmd(args.feature_backbone, FEATURE_INFER[args.feature_backbone], args.feature_model, extra_args, "feature")
-        await run_cmd("merged-feature-infer", cmd)
-
-        merged_feature_json = feature_out_dir / "tmp" / f"output_feature_{args.feature_model}.json"
-        split_jsons = split_feature_json(merged_feature_json, tags, output_root, args.feature_model)
-
+        feature_jsons = split_feature_json(merged_feature_json, tags, output_root, args.feature_model)
         for spec in feature_specs:
-            d = output_root / spec.tag / "features"
-            d.mkdir(parents=True, exist_ok=True)
-            feature_dirs[spec.tag] = d
-            if spec.tag in split_jsons:
-                feature_jsons[spec.tag] = split_jsons[spec.tag]
+            feature_dir = output_root / spec.tag / "features"
+            feature_dir.mkdir(parents=True, exist_ok=True)
+            feature_dirs[spec.tag] = feature_dir
 
-    # ── Stage 5: feature evaluation ──
+    # Stage 5: feature evaluation
     if "reference" in feature_jsons:
         specs[0].feature_gt = feature_jsons["reference"]
     if "generated" in feature_jsons:

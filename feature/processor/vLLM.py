@@ -1,8 +1,6 @@
 import os
 
-import numpy as np
 import pandas as pd
-from tqdm import tqdm
 import argparse
 import re
 from vllm import LLM, SamplingParams
@@ -50,10 +48,8 @@ class vLLMProcessor:
         llm = LLM(
             self.config["model_path"],
             tensor_parallel_size=self.config["tensor_parallel_size"],
-            data_parallel_size=self.config["data_parallel_size"],
             max_model_len=4096,
             gpu_memory_utilization=self.config["gpu_memory_utilization"],
-            distributed_executor_backend="external_launcher",
         )
         tokenizer = llm.get_tokenizer()
 
@@ -64,9 +60,6 @@ class vLLMProcessor:
         return labels[labels == 1].index.tolist() # positive: 1 # positive condition list for each study
 
     def run(self):
-        dp_rank = self.llm.llm_engine.vllm_config.parallel_config.data_parallel_rank
-        dp_size = self.llm.llm_engine.vllm_config.parallel_config.data_parallel_size
-
         # Step 1: Prepare Files
         df_repo = pd.read_csv(self.in_reports, dtype={'study_id':  str})\
             .sort_values(by='study_id')\
@@ -76,7 +69,7 @@ class vLLMProcessor:
             .reset_index(drop=True) # str | int | ... | int
         ls_id = df_repo['study_id'].unique()
 
-        print(f"[DP rank {dp_rank}] input labels file: {self.in_labels}")
+        print(f"input labels file: {self.in_labels}")
 
         # Step 2: Collect all prompts for batched inference
         all_prompt_dict = PromptDict.get_all_prompt()
@@ -105,58 +98,27 @@ class vLLMProcessor:
                     all_prompts.append(full_prompt)
                     prompt_keys.append((study_id, condition, feature))
 
-        # Step 3: Shard prompts by DP rank
-        cur_indices = list(range(dp_rank, len(all_prompts), dp_size))
-        cur_prompts = [all_prompts[i] for i in cur_indices]
-        cur_keys = [prompt_keys[i] for i in cur_indices]
-        print(f"[DP rank {dp_rank}] Processing {len(cur_prompts)}/{len(all_prompts)} prompts")
+        print(f"Processing {len(all_prompts)} prompts")
 
-        # Step 4: Batched inference — single llm.generate() call
-        cur_outputs = self.llm.generate(cur_prompts, self.sampling_params)
+        # Step 4: Batched inference
+        cur_outputs = self.llm.generate(all_prompts, self.sampling_params)
 
         # Step 5: Map results back to nested dict structure
-        for (study_id, condition, feature), output in zip(cur_keys, cur_outputs):
+        for (study_id, condition, feature), output in zip(prompt_keys, cur_outputs):
             generated_text = output.outputs[0].text
             match_feature = re.search(r'(\[.*?\])', generated_text, re.DOTALL)
             result = match_feature.group(1) if match_feature else "[\"NaN\"]"
 
-            if study_id not in output_dict:
-                output_dict[study_id] = {}
             if condition not in output_dict[study_id]:
                 output_dict[study_id][condition] = {}
             output_dict[study_id][condition][feature] = result
 
-        # Step 6: Save rank-specific results
+        # Step 6: Save results
         os.makedirs(os.path.join(self.out_dir, "tmp"), exist_ok=True)
-        rank_file = os.path.join(self.out_dir, f"tmp/output_feature_{self.model}_rank{dp_rank}.json")
-        with open(rank_file, "w", encoding="utf-8") as f:
+        output_path = os.path.join(self.out_dir, f"tmp/output_feature_{self.model}.json")
+        with open(output_path, "w", encoding="utf-8") as f:
             json.dump(output_dict, f, ensure_ascii=False, indent=4)
-
-        # Step 7: Barrier — wait for all ranks to finish writing
-        import torch.distributed as dist
-        dist.barrier()
-
-        # Step 8: Rank 0 merges all rank files into final output (sorted by study_id)
-        if dp_rank == 0:
-            merged = {}
-            for rank in range(dp_size):
-                rfile = os.path.join(self.out_dir, f"tmp/output_feature_{self.model}_rank{rank}.json")
-                with open(rfile, encoding="utf-8") as f:
-                    rank_data = json.load(f)
-                # Deep merge: study_id -> condition -> feature
-                for sid, conditions in rank_data.items():
-                    if sid not in merged:
-                        merged[sid] = {}
-                    for cond, features in conditions.items():
-                        if cond not in merged[sid]:
-                            merged[sid][cond] = {}
-                        merged[sid][cond].update(features)
-                os.remove(rfile)
-            merged = dict(sorted(merged.items()))
-            output_path = os.path.join(self.out_dir, f"tmp/output_feature_{self.model}.json")
-            with open(output_path, "w", encoding="utf-8") as f:
-                json.dump(merged, f, ensure_ascii=False, indent=4)
-            print(f"Saved output to {output_path}")
+        print(f"Saved output to {output_path}")
 
 
 
@@ -173,13 +135,3 @@ if __name__ == '__main__':
         output_dir=args.output_dir
     )
     Processor.run()
-
-    # Explicit cleanup: vLLM workers don't reliably release CUDA IPC handles at shutdown
-    import contextlib, gc, torch
-    from vllm.distributed.parallel_state import destroy_model_parallel
-    destroy_model_parallel()
-    with contextlib.suppress(AssertionError):
-        torch.distributed.destroy_process_group()
-    del Processor
-    gc.collect()
-    torch.cuda.empty_cache()

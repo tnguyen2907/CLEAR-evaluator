@@ -20,7 +20,9 @@ MODEL_CONFIGS = {
         "temperature": 1e-5,
         "max_tokens": 4096,
         "tensor_parallel_size": 1,
-        "data_parallel_size": 2,  # 2*H200, 1 replica per GPU
+        "data_parallel_size": 2,
+        # Optional: pin one replica per GPU explicitly, e.g. [["0"], ["1"]]
+        # "device_groups": [["0"], ["1"]],
         "gpu_memory_utilization": 0.9
     }
 }

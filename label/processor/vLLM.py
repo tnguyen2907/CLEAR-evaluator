@@ -1,7 +1,5 @@
 import os
 
-from tqdm import tqdm
-import numpy as np
 import pandas as pd
 import argparse
 import re
@@ -43,10 +41,8 @@ class vLLMProcessor:
         llm = LLM(
             self.config["model_path"],
             tensor_parallel_size=self.config["tensor_parallel_size"],
-            data_parallel_size=self.config["data_parallel_size"],
             max_model_len=4096,
             gpu_memory_utilization=self.config["gpu_memory_utilization"],
-            distributed_executor_backend="external_launcher",
         )
         tokenizer = llm.get_tokenizer()
 
@@ -56,11 +52,8 @@ class vLLMProcessor:
         '''
         Main execution method
         '''
-        dp_rank = self.llm.llm_engine.vllm_config.parallel_config.data_parallel_rank
-        dp_size = self.llm.llm_engine.vllm_config.parallel_config.data_parallel_size
-
         # Step 1: Load Files
-        print(f"[DP rank {dp_rank}] Loading input data...")
+        print("Loading input data...")
         df_gt_repo = pd.read_csv(self.in_csv)
         df_gt_repo['study_id'] = df_gt_repo['study_id'].apply(lambda x: str(x))
         df_gt_repo = df_gt_repo.sort_values(by='study_id').reset_index(drop=True)
@@ -84,19 +77,15 @@ class vLLMProcessor:
             )
             all_study_ids.append(row['study_id'])
 
-        # Step 3: Shard prompts by DP rank
-        cur_indices = list(range(dp_rank, len(all_prompts), dp_size))
-        cur_prompts = [all_prompts[i] for i in cur_indices]
-        cur_study_ids = [all_study_ids[i] for i in cur_indices]
-        print(f"[DP rank {dp_rank}] Processing {len(cur_prompts)}/{len(all_prompts)} prompts")
+        print(f"Processing {len(all_prompts)} prompts")
 
         # Step 4: Label Extraction
-        cur_outputs = self.llm.generate(cur_prompts, self.sampling_params)
-        assert len(cur_outputs) == len(cur_prompts), "Mismatch between outputs and input data length."
+        cur_outputs = self.llm.generate(all_prompts, self.sampling_params)
+        assert len(cur_outputs) == len(all_prompts), "Mismatch between outputs and input data length."
 
-        # Step 5: Extract results for this rank's shard
+        # Step 5: Extract results
         task1_results = {}
-        for study_id, output in zip(cur_study_ids, cur_outputs):
+        for study_id, output in zip(all_study_ids, cur_outputs):
             generated_text = output.outputs[0].text
             task1_match = re.search(r'<TASK1>(.*?)</TASK1>', generated_text, re.DOTALL)
 
@@ -111,30 +100,13 @@ class vLLMProcessor:
                 print(f"Warning: No correct label match for ID {study_id}")
                 task1_results[study_id] = generated_text
 
-        # Step 6: Save rank-specific results
+        # Step 6: Save results
         output_tmp_dir = os.path.join(self.out_dir, 'tmp')
         os.makedirs(output_tmp_dir, exist_ok=True)
-        rank_file = os.path.join(output_tmp_dir, f'output_labels_{self.model}_rank{dp_rank}.json')
-        with open(rank_file, 'w', encoding='utf-8') as f:
+        output_file = os.path.join(output_tmp_dir, f'output_labels_{self.model}.json')
+        with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(task1_results, f, ensure_ascii=False, indent=4)
-
-        # Step 7: Barrier — wait for all ranks to finish writing
-        import torch.distributed as dist
-        dist.barrier()
-
-        # Step 8: Rank 0 merges all rank files into final output (sorted by study_id)
-        if dp_rank == 0:
-            merged = {}
-            for rank in range(dp_size):
-                rfile = os.path.join(output_tmp_dir, f'output_labels_{self.model}_rank{rank}.json')
-                with open(rfile, encoding='utf-8') as f:
-                    merged.update(json.load(f))
-                os.remove(rfile)
-            merged = dict(sorted(merged.items()))
-            output_file = os.path.join(output_tmp_dir, f'output_labels_{self.model}.json')
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(merged, f, ensure_ascii=False, indent=4)
-            print(f"Results saved to {output_file}")
+        print(f"Results saved to {output_file}")
 
 
 if __name__ == '__main__':
@@ -155,13 +127,3 @@ if __name__ == '__main__':
         output_dir=args.output_dir
     )
     processor.run()
-
-    # Explicit cleanup: vLLM workers don't reliably release CUDA IPC handles at shutdown
-    import contextlib, gc, torch
-    from vllm.distributed.parallel_state import destroy_model_parallel
-    destroy_model_parallel()
-    with contextlib.suppress(AssertionError):
-        torch.distributed.destroy_process_group()
-    del processor
-    gc.collect()
-    torch.cuda.empty_cache()
