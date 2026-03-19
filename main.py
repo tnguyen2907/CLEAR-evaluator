@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,10 +40,21 @@ CXR_LABEL_COLUMNS = [
 
 @dataclass
 class DatasetSpec:
-    tag: str                 # “generated”, “reference”, etc.
+    tag: str                 # "generated", "reference", etc.
     reports: Path            # CSV with columns: study_id, report
     label_gt: Path | None = None    # CSV for label evaluation and TP filtering
     feature_gt: Path | None = None  # JSON (or CSV) for feature evaluation
+
+
+def get_vllm_config(backbone: str, model: str, stage: str):
+    """Import the model config to get TP/DP for torchrun launcher."""
+    if backbone != "vllm":
+        return None
+    if stage == "label":
+        from label.configs.models import MODEL_CONFIGS
+    else:
+        from feature.configs.models import MODEL_CONFIGS
+    return MODEL_CONFIGS.get(model)
 
 
 async def run_cmd(tag: str, command: list[str]) -> None:
@@ -53,21 +65,38 @@ async def run_cmd(tag: str, command: list[str]) -> None:
         raise RuntimeError(f"{tag} failed with exit code {rc}")
 
 
+def build_torchrun_cmd(module: str, nproc: int, args: list[str]) -> list[str]:
+    """Build a torchrun command for launching vLLM with data parallelism."""
+    return [
+        sys.executable, "-m", "torch.distributed.run",
+        f"--nproc-per-node={nproc}",
+        "-m", module,
+    ] + args
+
+
+def build_inference_cmd(backbone: str, module: str, model: str, extra_args: list[str], stage: str) -> list[str]:
+    """Build the subprocess command, using torchrun for vLLM backends."""
+    if backbone == "vllm":
+        config = get_vllm_config(backbone, model, stage)
+        tp = config.get("tensor_parallel_size", 1)
+        dp = config.get("data_parallel_size", 1)
+        nproc = tp * dp
+        return build_torchrun_cmd(module, nproc, extra_args)
+    else:
+        return [sys.executable, "-m", module] + extra_args
+
+
 async def run_label_inference(spec: DatasetSpec, backbone: str, model: str, output_root: Path) -> tuple[Path, Path]:
     out_dir = output_root / spec.tag / "labels"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "tmp").mkdir(exist_ok=True)
 
-    cmd = [
-        sys.executable,
-        "-m", LABEL_INFER[backbone],
-        "--model_name",
-        model,
-        "--reports",
-        str(spec.reports),
-        "--output",
-        str(out_dir),
+    extra_args = [
+        "--model_name", model,
+        "--reports", str(spec.reports),
+        "--output", str(out_dir),
     ]
+    cmd = build_inference_cmd(backbone, LABEL_INFER[backbone], model, extra_args, "label")
     await run_cmd(f"{spec.tag}-label-infer", cmd)
     pred_json = out_dir / "tmp" / f"output_labels_{model}.json"
     return out_dir, pred_json
@@ -169,18 +198,13 @@ async def run_feature_inference(
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "tmp").mkdir(exist_ok=True)
 
-    cmd = [
-        sys.executable,
-        "-m", FEATURE_INFER[backbone],
-        "--model",
-        model,
-        "--reports",
-        str(spec.reports),
-        "--labels",
-        str(filtered_labels),
-        "--output",
-        str(out_dir),
+    extra_args = [
+        "--model", model,
+        "--reports", str(spec.reports),
+        "--labels", str(filtered_labels),
+        "--output", str(out_dir),
     ]
+    cmd = build_inference_cmd(backbone, FEATURE_INFER[backbone], model, extra_args, "feature")
     await run_cmd(f"{spec.tag}-feature-infer", cmd)
     gen_json = out_dir / "tmp" / f"output_feature_{model}.json"
     return out_dir, gen_json
@@ -215,22 +239,111 @@ async def run_feature_evaluation(
     await run_cmd(f"{spec.tag}-feature-eval", cmd)
 
 
+def merge_report_csvs(csv_paths: dict[str, Path], output_csv: Path) -> Path:
+    """Merge multiple report CSVs into one, prefixing study_id with source tag."""
+    dfs = []
+    for tag, path in csv_paths.items():
+        df = pd.read_csv(path, dtype={'study_id': str})
+        df['study_id'] = tag + '/' + df['study_id']
+        dfs.append(df)
+    merged = pd.concat(dfs, ignore_index=True)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    merged.to_csv(output_csv, index=False)
+    return output_csv
+
+
+def split_label_json(json_path: Path, tags: list[str], output_dir: Path, model: str) -> dict[str, Path]:
+    """Split a merged label JSON back into per-source JSONs."""
+    with open(json_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    results = {tag: {} for tag in tags}
+    for study_id, value in data.items():
+        # study_id is "tag/orig_study_id"
+        tag, orig_id = study_id.split('/', 1)
+        if tag in results:
+            results[tag][orig_id] = value
+
+    paths = {}
+    for tag, tag_data in results.items():
+        out_path = output_dir / tag / "labels" / "tmp" / f"output_labels_{model}.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, 'w', encoding='utf-8') as f:
+            json.dump(tag_data, f, ensure_ascii=False, indent=4)
+        paths[tag] = out_path
+    return paths
+
+
+def merge_label_csvs(csv_paths: dict[str, Path], output_csv: Path) -> Path:
+    """Merge multiple label CSVs into one, prefixing study_id with source tag."""
+    dfs = []
+    for tag, path in csv_paths.items():
+        df = pd.read_csv(path, dtype={'study_id': str})
+        df['study_id'] = tag + '/' + df['study_id']
+        dfs.append(df)
+    merged = pd.concat(dfs, ignore_index=True)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    merged.to_csv(output_csv, index=False)
+    return output_csv
+
+
+def split_feature_json(json_path: Path, tags: list[str], output_dir: Path, model: str) -> dict[str, Path]:
+    """Split a merged feature JSON back into per-source JSONs."""
+    with open(json_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    results = {tag: {} for tag in tags}
+    for study_id, value in data.items():
+        tag, orig_id = study_id.split('/', 1)
+        if tag in results:
+            results[tag][orig_id] = value
+
+    paths = {}
+    for tag, tag_data in results.items():
+        out_path = output_dir / tag / "features" / "tmp" / f"output_feature_{model}.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, 'w', encoding='utf-8') as f:
+            json.dump(tag_data, f, ensure_ascii=False, indent=4)
+        paths[tag] = out_path
+    return paths
+
+
 async def orchestrate(args: argparse.Namespace) -> None:
     output_root = args.output_root.resolve()
     specs: list[DatasetSpec] = [DatasetSpec("generated", args.gen_reports.resolve())]
     if args.gt_reports:
         specs.append(DatasetSpec("reference", args.gt_reports.resolve()))
 
+    tags = [spec.tag for spec in specs]
 
-    # Stage 1: label inference
-    label_results = []
+    # ── Stage 1: label inference (merged gen+ref → single model run) ──
+    merged_reports_csv = output_root / "tmp" / "merged_reports.csv"
+    merge_report_csvs({spec.tag: spec.reports for spec in specs}, merged_reports_csv)
+
+    # Create a temporary spec for the merged run
+    merged_label_spec = DatasetSpec("merged", merged_reports_csv)
+    label_out_dir = output_root / "merged" / "labels"
+    label_out_dir.mkdir(parents=True, exist_ok=True)
+    (label_out_dir / "tmp").mkdir(exist_ok=True)
+
+    extra_args = [
+        "--model_name", args.label_model,
+        "--reports", str(merged_reports_csv),
+        "--output", str(label_out_dir),
+    ]
+    cmd = build_inference_cmd(args.label_backbone, LABEL_INFER[args.label_backbone], args.label_model, extra_args, "label")
+    await run_cmd("merged-label-infer", cmd)
+
+    # Split merged results back to per-source
+    merged_label_json = label_out_dir / "tmp" / f"output_labels_{args.label_model}.json"
+    pred_jsons = split_label_json(merged_label_json, tags, output_root, args.label_model)
+
+    # Also create per-source label output dirs for eval
+    label_dirs = {}
     for spec in specs:
-        label_results.append(
-            await run_label_inference(spec, args.label_backbone, args.label_model, output_root)
-        )
-
-    label_dirs = {spec.tag: result[0] for spec, result in zip(specs, label_results)}
-    pred_jsons = {spec.tag: result[1] for spec, result in zip(specs, label_results)}
+        d = output_root / spec.tag / "labels"
+        d.mkdir(parents=True, exist_ok=True)
+        label_dirs[spec.tag] = d
 
     generated_spec = specs[0]
     reference_spec = next((spec for spec in specs if spec.tag == "reference"), None)
@@ -240,10 +353,10 @@ async def orchestrate(args: argparse.Namespace) -> None:
         generated_spec.label_gt = gt_csv_path
         reference_spec.label_gt = gt_csv_path
 
-    # Stage 2: label evaluation (gt and gen input as a pair)
+    # ── Stage 2: label evaluation ──
     await run_label_evaluation(generated_spec, label_dirs["generated"], args.label_model)
 
-    # Stage 3: build filtered label CSV for only true positive conditions in gt and gen
+    # ── Stage 3: build filtered label CSV ──
     filtered_csvs: dict[str, Path] = {}
     if generated_spec.label_gt is not None:
         filtered_csvs["generated"] = await asyncio.to_thread(
@@ -253,26 +366,49 @@ async def orchestrate(args: argparse.Namespace) -> None:
             output_root / "generated" / f"filtered_tp_labels_{args.label_model}.csv",
         )
 
-    # Stage 4: feature inference (gt and gen)
+    # Wait for vLLM CUDA cleanup before loading the next model
+    print("Waiting 15s for GPU memory cleanup...")
+    time.sleep(15)
+
+    # ── Stage 4: feature inference (merged gen+ref → single model run) ──
     feature_specs = [spec for spec in specs]
     feature_dirs: dict[str, Path] = {}
     feature_jsons: dict[str, Path] = {}
-    if feature_specs:
-        feature_results = []
-        for spec in feature_specs:
-            feature_results.append(
-                await run_feature_inference(
-                    spec,
-                    args.feature_backbone,
-                    args.feature_model,
-                    filtered_csvs["generated"],
-                    output_root,
-                )
-            )
-        feature_dirs = {spec.tag: result[0] for spec, result in zip(feature_specs, feature_results)}
-        feature_jsons = {spec.tag: result[1] for spec, result in zip(feature_specs, feature_results)}
+    if feature_specs and "generated" in filtered_csvs:
+        # Merge reports and labels for all sources
+        merged_feature_reports = output_root / "tmp" / "merged_feature_reports.csv"
+        merge_report_csvs({spec.tag: spec.reports for spec in feature_specs}, merged_feature_reports)
 
-    # Stage 5: feature evaluation (gt and gen input as a pair)
+        # For feature labels, we use the same filtered TP labels for all sources
+        # but need to prefix study_ids to match merged reports
+        merged_feature_labels = output_root / "tmp" / "merged_feature_labels.csv"
+        label_csv_paths = {spec.tag: filtered_csvs["generated"] for spec in feature_specs}
+        merge_label_csvs(label_csv_paths, merged_feature_labels)
+
+        feature_out_dir = output_root / "merged" / "features"
+        feature_out_dir.mkdir(parents=True, exist_ok=True)
+        (feature_out_dir / "tmp").mkdir(exist_ok=True)
+
+        extra_args = [
+            "--model", args.feature_model,
+            "--reports", str(merged_feature_reports),
+            "--labels", str(merged_feature_labels),
+            "--output", str(feature_out_dir),
+        ]
+        cmd = build_inference_cmd(args.feature_backbone, FEATURE_INFER[args.feature_backbone], args.feature_model, extra_args, "feature")
+        await run_cmd("merged-feature-infer", cmd)
+
+        merged_feature_json = feature_out_dir / "tmp" / f"output_feature_{args.feature_model}.json"
+        split_jsons = split_feature_json(merged_feature_json, tags, output_root, args.feature_model)
+
+        for spec in feature_specs:
+            d = output_root / spec.tag / "features"
+            d.mkdir(parents=True, exist_ok=True)
+            feature_dirs[spec.tag] = d
+            if spec.tag in split_jsons:
+                feature_jsons[spec.tag] = split_jsons[spec.tag]
+
+    # ── Stage 5: feature evaluation ──
     if "reference" in feature_jsons:
         specs[0].feature_gt = feature_jsons["reference"]
     if "generated" in feature_jsons:
