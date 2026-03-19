@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import importlib
 import json
 import sys
 import time
@@ -50,11 +51,14 @@ def get_vllm_config(backbone: str, model: str, stage: str):
     """Import the model config to get TP/DP for torchrun launcher."""
     if backbone != "vllm":
         return None
-    if stage == "label":
-        from label.configs.models import MODEL_CONFIGS
-    else:
-        from feature.configs.models import MODEL_CONFIGS
-    return MODEL_CONFIGS.get(model)
+
+    module_name = (
+        "clear_evaluator.label.configs.models"
+        if stage == "label"
+        else "clear_evaluator.feature.configs.models"
+    )
+    model_configs = importlib.import_module(module_name).MODEL_CONFIGS
+    return model_configs.get(model)
 
 
 async def run_cmd(tag: str, command: list[str]) -> None:

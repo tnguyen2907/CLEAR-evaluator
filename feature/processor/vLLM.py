@@ -82,8 +82,11 @@ class vLLMProcessor:
         all_prompt_dict = PromptDict.get_all_prompt()
         all_prompts = []       # flat list of formatted prompts
         prompt_keys = []       # (study_id, condition, feature) for each prompt
+        output_dict = {}
 
         for study_id in ls_id:
+            # Preserve empty studies so downstream consumers keep a 1:1 ID mapping.
+            output_dict.setdefault(study_id, {})
             report = df_repo[df_repo['study_id'] == study_id]['report'].iloc[0]
             label_row = df_labels[df_labels["study_id"] == study_id].iloc[0].drop("study_id")
             ls_conditions = self.get_positive_conditions(label_row)
@@ -112,7 +115,6 @@ class vLLMProcessor:
         cur_outputs = self.llm.generate(cur_prompts, self.sampling_params)
 
         # Step 5: Map results back to nested dict structure
-        output_dict = {}
         for (study_id, condition, feature), output in zip(cur_keys, cur_outputs):
             generated_text = output.outputs[0].text
             match_feature = re.search(r'(\[.*?\])', generated_text, re.DOTALL)
