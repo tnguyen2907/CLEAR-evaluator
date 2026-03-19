@@ -43,6 +43,7 @@ class vLLMProcessor:
             tensor_parallel_size=self.config["tensor_parallel_size"],
             max_model_len=4096,
             gpu_memory_utilization=self.config["gpu_memory_utilization"],
+            enable_prefix_caching=True,
         )
         tokenizer = llm.get_tokenizer()
 
