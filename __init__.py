@@ -82,15 +82,6 @@ def compute_clear(
         with open(gt_feature_json_path, encoding="utf-8") as j:
             gt_feature_json = json.load(j)
 
-        print("ids:", len(ids))
-        print("label_metrics:", len(label_metrics_df))
-        print("qa_metrics:", len(qa_metrics_df))
-        print("ie_metrics:", len(ie_metrics_df))
-        print("gen_label_json:", len(gen_label_json))
-        print("gt_label_json:", len(gt_label_json))
-        print("gen_feature_json:", len(gen_feature_json))
-        print("gt_feature_json:", len(gt_feature_json))
-
         assert (
             ids
             == label_metrics_df["study_id"].tolist()

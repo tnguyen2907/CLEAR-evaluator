@@ -95,3 +95,37 @@ When a reference dataset is provided, the same sub-directories are created under
 
 ## Citation
 If you use CLEAR in academic work, please cite the original CLEAR paper linked above.
+
+## Additions Relative to the Original Baseline Code
+Compared with the original baseline code state, this repository adds several practical changes to make the evaluator easier to run, easier to integrate, and more robust in downstream evaluation workflows.
+
+### 1. Package Entry Point
+This repo has been cleaned up so it can be installed and used as a Python package rather than only as a collection of scripts. In particular:
+
+- `__init__.py` now exposes `compute_clear(...)` as a package-level entry point.
+- Package/import cleanup has been applied across modules so the code can be invoked through `clear_evaluator.*` imports and standard packaging metadata in `pyproject.toml`.
+- `compute_clear(...)` runs the pipeline on temporary CSVs and asserts that intermediate outputs preserve the exact input `study_id` order.
+
+### 2. Per-Report Scoring Outputs
+The evaluation code now includes per-report outputs in addition to aggregate metrics:
+
+- `label/processor/eval.py` writes `label_metrics_per_report_<model>.csv`, including per-report positive F1.
+- `feature/processor/eval.py` writes `results_qa_per_report_<model>.csv` and `results_ie_per_report_<model>.csv`.
+- QA per-report scores are computed as mean row accuracies by `study_id`.
+- IE per-report scores currently use ROUGE-based row means by `study_id`.
+
+### 3. Refactored vLLM Data-Parallel Workflow
+The vLLM execution path has been refactored so data parallelism is handled at the application level by the pipeline orchestration:
+
+- `main.py` now merges generated and reference inputs within each stage, shards the merged CSV across replicas, assigns one subprocess per GPU group, and splits outputs back before evaluation.
+- `data_parallel_size` remains in model configs, but it is used by `main.py` as an orchestration parameter that determines how many replica groups to launch.
+- vLLM execution uses the standard `LLM(... tensor_parallel_size=...)` path while keeping the merged-per-stage workflow for label and feature inference.
+
+### 4. Robustness and Behavioral Fixes
+Several code paths were also adjusted to preserve report coverage and make the evaluator more fault-tolerant:
+
+- `label/processor/vLLM.py` preserves malformed label outputs under the same `study_id` instead of crashing or dropping them.
+- `feature/processor/vLLM.py` batches feature prompts in a single `llm.generate(...)` call per replica.
+- Reports with no positive conditions are preserved as empty dicts rather than being lost.
+- Malformed label JSON rows default to all `-1` during evaluation so the report is still included in scoring.
+- The per-report feature scoring path is intentionally lightweight; it is sufficient for current usage, though it may need additional cleanup for full compatibility with the optional LLM-based IE scoring path.
