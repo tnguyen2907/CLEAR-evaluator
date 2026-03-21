@@ -1,7 +1,5 @@
 import os
 
-from tqdm import tqdm
-import numpy as np
 import pandas as pd
 import argparse
 import re
@@ -16,11 +14,11 @@ def parse_args():
     parser.add_argument("--model_name", type=str, dest='model_name',
                         default=None,
                         help="Model name to select from MODEL_CONFIGS.")
-    parser.add_argument("--reports", type=str, 
-                        dest="input_csv", default=None, 
+    parser.add_argument("--reports", type=str,
+                        dest="input_csv", default=None,
                         help="Path to input CSV file containing reports.")
-    parser.add_argument("--output", type=str, 
-                        dest='output_dir', default=None, 
+    parser.add_argument("--output", type=str,
+                        dest='output_dir', default=None,
                         help="Directory path to output results.")
     args = parser.parse_known_args()
 
@@ -40,34 +38,16 @@ class vLLMProcessor:
         Initialize vLLM model
         '''
         sampling_params = SamplingParams(temperature=self.config['temperature'], max_tokens=self.config['max_tokens'])
-        llm = LLM(self.config["model_path"], tensor_parallel_size=self.config["tensor_parallel_size"], max_model_len=4096, gpu_memory_utilization=self.config.get("gpu_memory_utilization", 0.75))
+        llm = LLM(
+            self.config["model_path"],
+            tensor_parallel_size=self.config["tensor_parallel_size"],
+            max_model_len=4096,
+            gpu_memory_utilization=self.config["gpu_memory_utilization"],
+            enable_prefix_caching=True,
+        )
         tokenizer = llm.get_tokenizer()
 
         return sampling_params, tokenizer, llm
-
-    def run_label_extraction(self, df_gt_repo):
-        '''
-        Extract labels using zero-shot prompting
-        '''
-        all_prompt = []
-        prompt_s = SYS_PROMPT
-        
-        for _, row in df_gt_repo.iterrows():
-            report = row['report']
-
-            all_prompt.append(
-                self.tokenizer.apply_chat_template(
-                    [
-                        {"role": "system", "content": prompt_s},
-                        {"role": "user", "content": report},
-                    ],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-            )
-        
-        ls_all_outputs = self.llm.generate(all_prompt, self.sampling_params)
-        return ls_all_outputs
 
     def run(self):
         '''
@@ -78,37 +58,55 @@ class vLLMProcessor:
         df_gt_repo = pd.read_csv(self.in_csv)
         df_gt_repo['study_id'] = df_gt_repo['study_id'].apply(lambda x: str(x))
         df_gt_repo = df_gt_repo.sort_values(by='study_id').reset_index(drop=True)
+
+        # Step 2: Build all prompts
+        all_prompts = []
+        all_study_ids = []
+        prompt_s = SYS_PROMPT
+
+        for _, row in df_gt_repo.iterrows():
+            report = row['report']
+            all_prompts.append(
+                self.tokenizer.apply_chat_template(
+                    [
+                        {"role": "system", "content": prompt_s},
+                        {"role": "user", "content": report},
+                    ],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            )
+            all_study_ids.append(row['study_id'])
+
+        print(f"Processing {len(all_prompts)} prompts")
+
+        # Step 4: Label Extraction
+        cur_outputs = self.llm.generate(all_prompts, self.sampling_params)
+        assert len(cur_outputs) == len(all_prompts), "Mismatch between outputs and input data length."
+
+        # Step 5: Extract results
         task1_results = {}
-
-        # Step 2: Label Extraction
-        print("Running label extraction...")
-        ls_all_outputs = self.run_label_extraction(df_gt_repo)
-
-        assert len(ls_all_outputs) == len(df_gt_repo), "Mismatch between outputs and input data length."
-        print('Finished label extraction.')
-        print('Processing output...')
-
-        # Step 3: Extract results
-        for i, row in tqdm(df_gt_repo.iterrows(), total=len(df_gt_repo)):
-            id = row['study_id']
-            generated_text = ls_all_outputs[i].outputs[0].text
-            # print(generated_text)
+        for study_id, output in zip(all_study_ids, cur_outputs):
+            generated_text = output.outputs[0].text
             task1_match = re.search(r'<TASK1>(.*?)</TASK1>', generated_text, re.DOTALL)
-            
+
             if task1_match:
                 task1_content = task1_match.group(1).strip()
-                task1_results[id] = json.loads(task1_content)
+                try:
+                    task1_results[study_id] = json.loads(task1_content)
+                except json.JSONDecodeError:
+                    print(f"Warning: JSON parse error for ID {study_id}, content: {task1_content[:100]}")
+                    task1_results[study_id] = generated_text
             else:
-                print(f"Warning: No correct label match for ID {id}")
-                task1_results[id] = generated_text
-        
-        # Step 4: Save files
-        print("Saving results...")
+                print(f"Warning: No correct label match for ID {study_id}")
+                task1_results[study_id] = generated_text
+
+        # Step 6: Save results
         output_tmp_dir = os.path.join(self.out_dir, 'tmp')
         os.makedirs(output_tmp_dir, exist_ok=True)
         output_file = os.path.join(output_tmp_dir, f'output_labels_{self.model}.json')
-        with open(output_file, 'w', encoding='utf-8') as task1_file:
-            json.dump(task1_results, task1_file, ensure_ascii=False, indent=4)
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(task1_results, f, ensure_ascii=False, indent=4)
         print(f"Results saved to {output_file}")
 
 
@@ -120,7 +118,7 @@ if __name__ == '__main__':
 
     if not args.input_csv:
         raise ValueError("Input CSV file must be specified with --input_csv")
-    
+
     if not args.output_dir:
         raise ValueError("Output directory must be specified with --o")
 
